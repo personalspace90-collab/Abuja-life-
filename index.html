@@ -1,0 +1,840 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+/* ───────────────────────── storage helpers ───────────────────────── */
+const STORE_OK = typeof window !== "undefined" && !!window.storage;
+const S = {
+  async get(k, shared) {
+    try {
+      const r = await window.storage.get(k, shared);
+      return r ? JSON.parse(r.value) : null;
+    } catch {
+      return null;
+    }
+  },
+  async set(k, v, shared) {
+    try {
+      const r = await window.storage.set(k, JSON.stringify(v), shared);
+      return !!r;
+    } catch {
+      return false;
+    }
+  },
+  async del(k, shared) {
+    try {
+      await window.storage.delete(k, shared);
+    } catch {}
+  },
+  async list(prefix, shared) {
+    try {
+      const r = await window.storage.list(prefix, shared);
+      return r && r.keys ? r.keys : [];
+    } catch {
+      return [];
+    }
+  },
+};
+
+async function hashPin(u, pin) {
+  const data = new TextEncoder().encode(`${u}:${pin}:lagoslife`);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/* ───────────────────────── game data ───────────────────────── */
+const LOCS = {
+  home: { name: "Surulere flat", area: "Surulere", bg: "#0D5C63", slogan: "Light dey, light no dey", hours: [0, 24], icon: "🏠" },
+  village: { name: "Computer Village", area: "Ikeja", bg: "#3C4048", slogan: "Original, tokunbo, anything", hours: [8, 19], icon: "📱" },
+  shitta: { name: "Shitta amala spot", area: "Surulere", bg: "#8A4B1F", slogan: "Swallow first, talk later", hours: [10, 23], icon: "🍲" },
+  beach: { name: "Lekki beach", area: "Lekki", bg: "#1F7FA6", slogan: "Sand, sun and small chops", hours: [0, 24], icon: "🏖️" },
+  quilox: { name: "Quilox", area: "Victoria Island", bg: "#5B2A86", slogan: "Night is young, my guy", hours: [21, 28], icon: "🪩" },
+};
+
+const DD = {
+  "home|village": 3, "home|shitta": 1, "home|beach": 4, "home|quilox": 4,
+  "shitta|village": 3, "shitta|beach": 4, "shitta|quilox": 4,
+  "village|beach": 5, "village|quilox": 5, "beach|quilox": 2,
+};
+const dist = (a, b) => DD[`${a}|${b}`] ?? DD[`${b}|${a}`] ?? 3;
+
+const MODES = {
+  danfo: { label: "Danfo", costPer: 150, minPer: 25, note: "Cheap, slow, plenty gist" },
+  okada: { label: "Okada", costPer: 400, minPer: 14, note: "Fast, a little risky" },
+  ride: { label: "Ride-hail", costPer: 1200, minPer: 10, note: "Air-con, no stories" },
+};
+
+const ACTIONS = {
+  home: [
+    { id: "sleep", label: "Sleep", mins: 480, fx: { energy: 70, mood: 5 }, rest: true },
+    { id: "nap", label: "Take a nap", mins: 90, fx: { energy: 22 }, rest: true },
+    { id: "cook", label: "Cook indomie and egg", cost: 400, mins: 30, fx: { food: 35, mood: 3 } },
+    { id: "gen", label: "Fuel the generator", cost: 2000, mins: 10, special: "gen", note: "Light for 6 hours" },
+    { id: "tv", label: "Watch Nollywood", mins: 120, fx: { mood: 16, energy: -3 }, needsPower: true },
+  ],
+  village: [
+    { id: "shift", label: "Work a phone-repair shift", mins: 240, earn: [4500, 7500], fx: { energy: -22, food: -10, mood: -6 }, window: [8, 15] },
+    { id: "flip", label: "Haggle and flip gadgets", mins: 120, earn: [-1500, 5500], fx: { energy: -10, mood: 2 }, window: [8, 17], note: "Could lose money" },
+  ],
+  shitta: [
+    { id: "amala", label: "Amala, gbegiri and ewedu", cost: 2500, mins: 45, fx: { food: 60, mood: 10 } },
+    { id: "suya", label: "Suya and cold Malta", cost: 1200, mins: 25, fx: { food: 25, mood: 6 } },
+    { id: "gist", label: "Gist with the regulars", mins: 60, fx: { social: 25, mood: 8 } },
+  ],
+  beach: [
+    { id: "chill", label: "Sit by the water", mins: 90, fx: { mood: 18, social: 5, energy: 5 } },
+    { id: "ball", label: "Join beach football", mins: 90, fx: { energy: -15, mood: 15, social: 20, food: -8 } },
+    { id: "coco", label: "Buy fresh coconut", cost: 500, mins: 15, fx: { food: 8, mood: 4 } },
+  ],
+  quilox: [
+    { id: "bar", label: "Slip into the bar", cost: 6000, mins: 90, fx: { mood: 15, social: 15, energy: -8 } },
+    { id: "party", label: "Party till late", cost: 15000, mins: 180, fx: { mood: 35, social: 35, energy: -25, food: -10 } },
+  ],
+};
+
+const AVATARS = ["🧑🏾", "👩🏾", "🧔🏾", "👩🏾‍🦱", "🧕🏾", "👨🏾‍🦲"];
+const NEEDS = [
+  ["energy", "Energy", "var(--danfo)"],
+  ["food", "Food", "var(--okada)"],
+  ["mood", "Mood", "var(--ankara)"],
+  ["social", "Social", "var(--lagoon)"],
+];
+
+/* ───────────────────────── helpers ───────────────────────── */
+const clamp = (v) => Math.max(0, Math.min(100, Math.round(v * 10) / 10));
+const naira = (n) => `₦${Math.round(n).toLocaleString("en-NG")}`;
+const hourOf = (t) => Math.floor((t % 1440) / 60);
+const dayOf = (t) => Math.floor(t / 1440) + 1;
+const fmtClock = (t) => {
+  const m = t % 1440;
+  let h = Math.floor(m / 60);
+  const mm = String(m % 60).padStart(2, "0");
+  const ap = h >= 12 ? "PM" : "AM";
+  h = h % 12 || 12;
+  return `${h}:${mm} ${ap}`;
+};
+const hr = (h) => `${h % 12 || 12}${h % 24 >= 12 ? "pm" : "am"}`;
+const fmtDur = (m) => (m >= 60 ? `${m / 60}h` : `${m}m`);
+const isOpen = (loc, h) => {
+  const [a, b] = LOCS[loc].hours;
+  if (b > 24) return h >= a || h < b - 24;
+  return h >= a && h < b;
+};
+const naturalOn = (s) => s.t >= s.powerOutUntil;
+const powerOn = (s) => naturalOn(s) || s.t < s.genUntil;
+
+const newGame = (name, avatar) => ({
+  name, avatar, t: 7 * 60, cash: 8000, energy: 80, food: 60, mood: 60, social: 40,
+  loc: "home", powerOutUntil: 0, genUntil: 0, earned: 0,
+  log: ["You wake up in Surulere with ₦8,000 and big plans."],
+});
+
+const profOf = (g, u) => ({ u, name: g.name, avatar: g.avatar, loc: g.loc, ts: Date.now(), cash: g.cash, day: dayOf(g.t) });
+const isOnline = (p) => Date.now() - p.ts < 90000;
+
+/* ───────────────────────── game engine ───────────────────────── */
+function advance(g, mins, rest = false) {
+  const s = { ...g };
+  const notes = [];
+  const wasOut = !naturalOn(s);
+  for (let m = 0; m < mins; m += 30) {
+    const dt = Math.min(30, mins - m);
+    const f = dt / 60;
+    s.t += dt;
+    s.food = clamp(s.food - 4 * f);
+    if (!rest) s.energy = clamp(s.energy - 3 * f);
+    s.mood = clamp(s.mood - 1.5 * f - (s.food <= 0 ? 3 * f : 0));
+    s.social = clamp(s.social - 1.2 * f);
+    if (s.loc === "home" && !powerOn(s)) s.mood = clamp(s.mood - 2 * f);
+    const r = Math.random();
+    if (naturalOn(s) && r < 0.05) {
+      s.powerOutUntil = s.t + 120 + Math.floor(Math.random() * 240);
+      notes.push("NEPA took the light.");
+    } else if (r > 0.985) {
+      s.cash += 2000;
+      notes.push("A cousin sent ₦2,000 with the message “small something”.");
+    } else if (r > 0.965) {
+      s.mood = clamp(s.mood - 4);
+      notes.push("Rain meets you outside. Your mood drops with the temperature.");
+    }
+  }
+  if (wasOut && naturalOn(s)) notes.push("Light is back. Somewhere a neighbour shouts “Up NEPA!”");
+  if (s.energy <= 0) {
+    s.energy = 45;
+    s.t += 360;
+    s.food = clamp(s.food - 20);
+    s.cash = Math.max(0, s.cash - 2000);
+    notes.push("You collapsed from tiredness. Hours pass and ₦2,000 disappears from your pocket.");
+  }
+  s.log = [...notes.reverse(), ...s.log].slice(0, 30);
+  return s;
+}
+
+function applyAction(g, a) {
+  let s = { ...g, cash: g.cash - (a.cost || 0) };
+  let earned = 0;
+  if (a.earn) {
+    earned = Math.round((a.earn[0] + Math.random() * (a.earn[1] - a.earn[0])) / 50) * 50;
+    if (s.mood <= 0 && earned > 0) earned = Math.round(earned * 0.7);
+    s.cash += earned;
+    s.earned = (s.earned || 0) + Math.max(0, earned);
+  }
+  s = advance(s, a.mins, a.rest);
+  const fx = a.fx || {};
+  Object.keys(fx).forEach((k) => (s[k] = clamp(s[k] + fx[k])));
+  if (a.special === "gen") s.genUntil = s.t + 360;
+  const tail = earned ? `: ${earned >= 0 ? "+" : "-"}${naira(Math.abs(earned))}` : "";
+  s.log = [`${a.label}${tail}`, ...s.log].slice(0, 30);
+  return s;
+}
+
+function travelCost(from, to, mode) {
+  return Math.round((MODES[mode].costPer * dist(from, to)) / 50) * 50;
+}
+function travelMins(from, to, mode) {
+  return MODES[mode].minPer * dist(from, to);
+}
+
+function applyTravel(g, dest, mode) {
+  const M = MODES[mode];
+  const cost = travelCost(g.loc, dest, mode);
+  let mins = travelMins(g.loc, dest, mode);
+  const extra = [];
+  const h = hourOf(g.t);
+  const rush = (h >= 7 && h < 10) || (h >= 16 && h < 20);
+  if (mode !== "okada" && rush && Math.random() < 0.5) {
+    mins += 45;
+    extra.push("Go-slow on Third Mainland Bridge. You lose 45 minutes.");
+  }
+  let s = { ...g, cash: g.cash - cost, loc: dest };
+  s = advance(s, mins, false);
+  if (mode === "danfo") s.energy = clamp(s.energy - 3);
+  if (mode === "ride") s.mood = clamp(s.mood + 3);
+  if (mode === "okada" && Math.random() < 0.04) {
+    s.mood = clamp(s.mood - 12);
+    s.cash = Math.max(0, s.cash - 3000);
+    extra.push("The okada slid on wet road. Small scratch and ₦3,000 for first aid.");
+  }
+  s.log = [`You took ${M.label.toLowerCase()} to ${LOCS[dest].name}.`, ...extra.reverse(), ...s.log].slice(0, 30);
+  const pending = mode !== "ride" && Math.random() < 0.1 ? "checkpoint" : null;
+  return { s, pending };
+}
+
+function blockReason(a, g) {
+  if ((a.cost || 0) > g.cash) return "Not enough cash";
+  const h = hourOf(g.t);
+  if (!isOpen(g.loc, h)) return "Closed right now";
+  if (a.needsPower && !powerOn(g)) return "No light";
+  if (a.window && !(h >= a.window[0] && h < a.window[1])) return `Only ${hr(a.window[0])} to ${hr(a.window[1])}`;
+  return null;
+}
+
+function fxText(a) {
+  const parts = [];
+  if (a.cost) parts.push(`-${naira(a.cost)}`);
+  if (a.earn) parts.push(`earn ${naira(Math.max(0, a.earn[0]))} to ${naira(a.earn[1])}`);
+  Object.entries(a.fx || {}).forEach(([k, v]) => parts.push(`${v > 0 ? "+" : ""}${v} ${k}`));
+  if (a.note) parts.push(a.note);
+  return parts.join(", ");
+}
+
+/* ───────────────────────── styles ───────────────────────── */
+const CSS = `
+.ll{--lagoon:#0D5C63;--danfo:#F6B90F;--asphalt:#272A2F;--sky:#EAF0F6;--okada:#D6452B;--ankara:#E0527F;--ink:#1B1E22;--mute:#5C6570;
+font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--sky);color:var(--ink);min-height:100vh;display:flex;justify-content:center;-webkit-text-size-adjust:100%}
+.ll *{box-sizing:border-box}
+.ll button{font:inherit;cursor:pointer;color:inherit}
+.ll button:focus-visible,.ll input:focus-visible{outline:3px solid var(--lagoon);outline-offset:2px}
+.wrap{width:100%;max-width:480px;padding:12px 14px 96px}
+.paint{font-family:Impact,Haettenschweiler,"Arial Narrow Bold",sans-serif;letter-spacing:.03em;font-weight:400}
+.bus{background:var(--danfo);border:3px solid var(--asphalt);border-radius:16px;padding:14px 14px 0;overflow:hidden}
+.bus h1,.bus h2{margin:0;color:var(--asphalt);line-height:1.05}
+.bus h1{font-size:44px}.bus h2{font-size:30px}
+.band{background:var(--asphalt);color:var(--danfo);margin:12px -14px 0;padding:7px 14px;font-size:15px;letter-spacing:.04em}
+.row{display:flex;align-items:center;gap:10px}
+.between{justify-content:space-between}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px}
+.pill{background:#fff;border:2px solid var(--asphalt);border-radius:999px;padding:5px 12px;font-weight:700;font-size:14px;white-space:nowrap}
+.pill.warn{background:var(--okada);color:#fff;border-color:var(--okada)}
+.panel{background:#fff;border:2px solid var(--asphalt);border-radius:14px;padding:12px;margin-top:12px}
+.panel h3{margin:0 0 8px;font-size:16px}
+.needs{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+.need .lab{display:flex;justify-content:space-between;font-size:13px;font-weight:600}
+.need .lab.low{color:var(--okada)}
+.track{height:10px;background:#E3E8EE;border-radius:6px;margin-top:4px;overflow:hidden}
+.fill{height:100%;border-radius:6px;transition:width .3s}
+.act{display:block;width:100%;text-align:left;background:#fff;border:2px solid var(--asphalt);border-radius:12px;padding:10px 12px;margin-top:8px;min-height:48px}
+.act:hover:not(:disabled){background:#FFF6D6}
+.act:disabled{opacity:.55;cursor:not-allowed;border-color:#9AA3AD}
+.act b{display:block;font-size:15px}
+.act span{display:block;font-size:12.5px;color:var(--mute);margin-top:2px}
+.act .why{color:var(--okada);font-weight:700}
+.log{font-size:13.5px;color:var(--mute);margin:0;padding-left:18px}
+.log li{margin:3px 0}.log li:first-child{color:var(--ink);font-weight:600}
+.nav{position:fixed;left:0;right:0;bottom:0;display:flex;justify-content:center;background:var(--asphalt);border-top:3px solid var(--danfo)}
+.nav div{width:100%;max-width:480px;display:grid;grid-template-columns:repeat(4,1fr)}
+.nav button{background:none;border:0;color:#C9D0D8;padding:14px 4px;font-weight:700;font-size:14px;min-height:52px;position:relative}
+.nav button[aria-current="true"]{color:var(--danfo)}
+.nav button[aria-current="true"]::after{content:"";position:absolute;left:25%;right:25%;top:0;height:3px;background:var(--danfo)}
+.badge{background:var(--okada);color:#fff;border-radius:999px;font-size:11px;padding:1px 6px;margin-left:4px}
+.btn{background:var(--asphalt);color:var(--danfo);border:0;border-radius:10px;padding:10px 14px;font-weight:700;min-height:44px}
+.btn.alt{background:#fff;color:var(--asphalt);border:2px solid var(--asphalt)}
+.btn.sm{padding:6px 10px;min-height:36px;font-size:13px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.in{width:100%;border:2px solid var(--asphalt);border-radius:10px;padding:11px 12px;font:inherit;background:#fff;min-height:46px}
+.lbl{display:block;font-weight:700;font-size:14px;margin:12px 0 4px}
+.err{color:var(--okada);font-weight:700;font-size:14px;margin:8px 0 0}
+.av{display:flex;gap:8px;flex-wrap:wrap}
+.av button{font-size:26px;background:#fff;border:2px solid #B9C2CC;border-radius:12px;width:52px;height:52px}
+.av button[aria-pressed="true"]{border-color:var(--asphalt);background:var(--danfo)}
+.loc{width:100%;text-align:left;display:flex;gap:12px;align-items:center;background:#fff;border:2px solid var(--asphalt);border-radius:12px;padding:10px 12px;margin-top:8px;min-height:60px}
+.loc .ic{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;font-size:22px;flex:none}
+.loc small{display:block;color:var(--mute);font-size:12.5px}
+.loc[aria-current="true"]{background:#FFF6D6}
+.person{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid #E3E8EE}
+.person:first-of-type{border-top:0}
+.person .nm{flex:1;min-width:0}
+.person .nm b{display:block;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.person .nm small{color:var(--mute);font-size:12.5px}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;background:#B9C2CC}
+.dot.on{background:#2F9E5B}
+.sheet-bg{position:fixed;inset:0;background:rgba(20,22,26,.55);display:flex;align-items:flex-end;justify-content:center;z-index:20}
+.sheet{width:100%;max-width:480px;background:var(--sky);border-radius:18px 18px 0 0;border-top:4px solid var(--danfo);padding:16px 14px 22px}
+.toast{position:fixed;top:10px;left:50%;transform:translateX(-50%);background:var(--asphalt);color:var(--danfo);padding:10px 16px;border-radius:999px;font-weight:700;font-size:14px;z-index:30;max-width:92vw;text-align:center}
+.chat{max-height:46vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:2px}
+.msg{background:#fff;border:2px solid #CBD3DB;border-radius:12px;padding:7px 10px;max-width:88%;align-self:flex-start;font-size:14.5px;word-break:break-word}
+.msg.me{align-self:flex-end;background:var(--danfo);border-color:var(--asphalt)}
+.msg small{display:block;color:var(--mute);font-size:11.5px;margin-bottom:1px}
+.hint{font-size:12.5px;color:var(--mute);margin:8px 0 0;line-height:1.4}
+@media (prefers-reduced-motion:reduce){.ll *{transition:none!important}}
+`;
+
+/* ───────────────────────── components ───────────────────────── */
+function Auth({ onSignup, onLogin, onSolo }) {
+  const [mode, setMode] = useState("signup");
+  const [u, setU] = useState("");
+  const [pin, setPin] = useState("");
+  const [av, setAv] = useState(AVATARS[0]);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const go = async () => {
+    setBusy(true);
+    setErr("");
+    const e = mode === "signup" ? await onSignup(u, pin, av) : await onLogin(u, pin);
+    if (e) setErr(e);
+    setBusy(false);
+  };
+
+  return (
+    <div className="wrap">
+      <div className="bus">
+        <h1 className="paint">Lagos Life</h1>
+        <div className="band paint">Live your own Lagos story</div>
+      </div>
+      <div className="panel">
+        <div className="row" style={{ gap: 8 }}>
+          <button className={mode === "signup" ? "btn" : "btn alt"} onClick={() => setMode("signup")}>Create account</button>
+          <button className={mode === "login" ? "btn" : "btn alt"} onClick={() => setMode("login")}>Log in</button>
+        </div>
+        <label className="lbl" htmlFor="un">Username</label>
+        <input id="un" className="in" value={u} maxLength={16} autoCapitalize="none" autoCorrect="off" onChange={(e) => setU(e.target.value)} />
+        <label className="lbl" htmlFor="pn">4-digit PIN</label>
+        <input id="pn" className="in" type="password" inputMode="numeric" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))} />
+        {mode === "signup" && (
+          <>
+            <span className="lbl">Pick your look</span>
+            <div className="av">
+              {AVATARS.map((a) => (
+                <button key={a} aria-pressed={av === a} aria-label={`Avatar ${a}`} onClick={() => setAv(a)}>{a}</button>
+              ))}
+            </div>
+          </>
+        )}
+        {err && <p className="err" role="alert">{err}</p>}
+        <button className="btn" style={{ width: "100%", marginTop: 14 }} disabled={busy || !STORE_OK} onClick={go}>
+          {busy ? "Please wait" : mode === "signup" ? "Start my Lagos life" : "Log in"}
+        </button>
+        {!STORE_OK && (
+          <>
+            <p className="hint">Accounts and multiplayer need shared storage, which isn't available here. You can still play solo.</p>
+            <button className="btn alt" style={{ width: "100%", marginTop: 8 }} onClick={() => onSolo(av)}>Play solo</button>
+          </>
+        )}
+        <p className="hint">
+          Accounts, progress, chat and cash totals are stored in shared storage, so other players can see them. Use a PIN you don't use anywhere else.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function Bar({ id, label, color, value }) {
+  return (
+    <div className="need">
+      <div className={`lab ${value < 20 ? "low" : ""}`}>
+        <span>{label}{value < 20 ? " is low" : ""}</span>
+        <span>{Math.round(value)}</span>
+      </div>
+      <div className="track" role="progressbar" aria-label={label} aria-valuenow={Math.round(value)} aria-valuemin={0} aria-valuemax={100}>
+        <div className="fill" style={{ width: `${value}%`, background: color }} />
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────────────── main app ───────────────────────── */
+export default function LagosLife() {
+  const [phase, setPhase] = useState("boot");
+  const [user, setUser] = useState("");
+  const [g, setG] = useState(null);
+  const [tab, setTab] = useState("life");
+  const [people, setPeople] = useState([]);
+  const [chat, setChat] = useState([]);
+  const [fr, setFr] = useState({ friends: [], incoming: [] });
+  const [toast, setToast] = useState("");
+  const [dest, setDest] = useState(null);
+  const [pending, setPending] = useState(null);
+  const [draft, setDraft] = useState("");
+  const [addName, setAddName] = useState("");
+  const [sent, setSent] = useState([]);
+
+  const gRef = useRef(null);
+  gRef.current = g;
+  const chatEnd = useRef(null);
+  const net = STORE_OK && user !== "guest" && user !== "";
+
+  const flash = useCallback((m) => {
+    setToast(m);
+    setTimeout(() => setToast(""), 3000);
+  }, []);
+
+  const enter = (u, gm) => {
+    setUser(u);
+    setG(gm);
+    setPhase("game");
+    setTab("life");
+  };
+
+  /* boot: restore session */
+  useEffect(() => {
+    (async () => {
+      if (!STORE_OK) return setPhase("auth");
+      const ses = await S.get("session", false);
+      if (ses && ses.u) {
+        const sv = await S.get("save:" + ses.u, true);
+        if (sv) return enter(ses.u, sv);
+      }
+      setPhase("auth");
+    })();
+  }, []);
+
+  /* auth */
+  const signup = async (raw, pin, avatar) => {
+    const u = raw.trim().toLowerCase();
+    if (!/^[a-z0-9_]{3,16}$/.test(u)) return "Use 3 to 16 letters, numbers or underscores.";
+    if (!/^\d{4}$/.test(pin)) return "Your PIN must be 4 digits.";
+    if (await S.get("acct:" + u, true)) return "That username is taken. Pick another.";
+    const ok = await S.set("acct:" + u, { h: await hashPin(u, pin), c: Date.now() }, true);
+    if (!ok) return "Couldn't create the account. Try again.";
+    const ng = newGame(u, avatar);
+    await S.set("save:" + u, ng, true);
+    await S.set("prof:" + u, profOf(ng, u), true);
+    await S.set("session", { u }, false);
+    enter(u, ng);
+    return null;
+  };
+  const login = async (raw, pin) => {
+    const u = raw.trim().toLowerCase();
+    const acct = await S.get("acct:" + u, true);
+    if (!acct) return "No account with that username.";
+    if (acct.h !== (await hashPin(u, pin))) return "Wrong PIN. Try again.";
+    const sv = (await S.get("save:" + u, true)) || newGame(u, AVATARS[0]);
+    await S.set("session", { u }, false);
+    enter(u, sv);
+    return null;
+  };
+  const solo = (av) => enter("guest", newGame("Guest", av));
+  const logout = async () => {
+    await S.del("session", false);
+    setG(null);
+    setUser("");
+    setPhase("auth");
+  };
+
+  /* save + presence (debounced) */
+  useEffect(() => {
+    if (phase !== "game" || !g || !net) return;
+    const id = setTimeout(() => {
+      S.set("save:" + user, g, true);
+      S.set("prof:" + user, profOf(g, user), true);
+    }, 800);
+    return () => clearTimeout(id);
+  }, [g, phase]);
+
+  /* polling: presence, chat, friends, gifts */
+  const loadChat = useCallback(async () => {
+    const cur = gRef.current;
+    if (!cur) return;
+    const msgs = (await S.get("chat:" + cur.loc, true)) || [];
+    setChat(msgs);
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const cur = gRef.current;
+    if (!cur) return;
+    S.set("prof:" + user, profOf(cur, user), true);
+    const keys = (await S.list("prof:", true)).slice(0, 40);
+    const profs = (await Promise.all(keys.map((k) => S.get(k, true)))).filter(Boolean);
+    setPeople(profs);
+    loadChat();
+    const f = await S.get("fr:" + user, true);
+    if (f) setFr({ friends: f.friends || [], incoming: f.incoming || [] });
+    const inbox = await S.get("inbox:" + user, true);
+    if (inbox && inbox.length) {
+      const tot = inbox.reduce((a, b) => a + b.amt, 0);
+      await S.set("inbox:" + user, [], true);
+      setG((p) => ({ ...p, cash: p.cash + tot, log: [`${inbox.map((i) => i.name).join(", ")} sent you ${naira(tot)}.`, ...p.log].slice(0, 30) }));
+      flash(`Gift received: ${naira(tot)}`);
+    }
+  }, [user, loadChat, flash]);
+
+  useEffect(() => {
+    if (phase !== "game" || !net) return;
+    refresh();
+    const id = setInterval(refresh, 7000);
+    return () => clearInterval(id);
+  }, [phase, net, refresh]);
+
+  useEffect(() => {
+    if (phase === "game" && net && g) loadChat();
+  }, [g && g.loc]);
+
+  useEffect(() => {
+    if (tab === "chat" && chatEnd.current) chatEnd.current.scrollIntoView({ block: "end" });
+  }, [chat, tab]);
+
+  /* social actions */
+  const sendChat = async () => {
+    const text = draft.trim().slice(0, 140);
+    if (!text || !net) return;
+    setDraft("");
+    const k = "chat:" + g.loc;
+    const cur = (await S.get(k, true)) || [];
+    const next = [...cur, { u: user, name: g.name, avatar: g.avatar, text, ts: Date.now() }].slice(-40);
+    await S.set(k, next, true);
+    setChat(next);
+  };
+  const requestFriend = async (raw) => {
+    const u = raw.trim().toLowerCase();
+    if (!u || u === user) return flash("Enter another player's username.");
+    if (!(await S.get("acct:" + u, true))) return flash("No player with that username.");
+    const theirs = (await S.get("fr:" + u, true)) || { friends: [], incoming: [] };
+    if (theirs.friends.includes(user)) return flash("You're already friends.");
+    if (!theirs.incoming.includes(user)) theirs.incoming = [...theirs.incoming, user];
+    await S.set("fr:" + u, theirs, true);
+    setSent((s) => [...s, u]);
+    setAddName("");
+    flash("Friend request sent.");
+  };
+  const acceptFriend = async (u) => {
+    const mine = (await S.get("fr:" + user, true)) || { friends: [], incoming: [] };
+    mine.incoming = mine.incoming.filter((x) => x !== u);
+    if (!mine.friends.includes(u)) mine.friends = [...mine.friends, u];
+    await S.set("fr:" + user, mine, true);
+    const theirs = (await S.get("fr:" + u, true)) || { friends: [], incoming: [] };
+    if (!theirs.friends.includes(user)) theirs.friends = [...theirs.friends, user];
+    await S.set("fr:" + u, theirs, true);
+    setFr({ friends: mine.friends, incoming: mine.incoming });
+    flash(`You and ${u} are friends.`);
+  };
+  const declineFriend = async (u) => {
+    const mine = (await S.get("fr:" + user, true)) || { friends: [], incoming: [] };
+    mine.incoming = mine.incoming.filter((x) => x !== u);
+    await S.set("fr:" + user, mine, true);
+    setFr({ friends: mine.friends, incoming: mine.incoming });
+  };
+  const sendGift = async (u, amt = 1000) => {
+    if (g.cash < amt) return flash("Not enough cash.");
+    const box = (await S.get("inbox:" + u, true)) || [];
+    await S.set("inbox:" + u, [...box, { name: g.name, amt, ts: Date.now() }], true);
+    setG((p) => ({ ...p, cash: p.cash - amt, log: [`You sent ${naira(amt)} to ${u}.`, ...p.log].slice(0, 30) }));
+    flash(`Sent ${naira(amt)} to ${u}.`);
+  };
+
+  /* game actions */
+  const run = (a) => setG((p) => applyAction(p, a));
+  const goTo = (mode) => {
+    const { s, pending: pd } = applyTravel(g, dest, mode);
+    setG(s);
+    setDest(null);
+    setTab("life");
+    if (pd) setPending(pd);
+  };
+  const payOfficer = () => {
+    setG((p) => ({ ...p, cash: Math.max(0, p.cash - 1000), log: ["You settled the checkpoint with ₦1,000.", ...p.log].slice(0, 30) }));
+    setPending(null);
+  };
+  const argueOfficer = () => {
+    if (Math.random() < 0.55) {
+      setG((p) => ({ ...p, log: ["You argued your case calmly. The officer waves you through.", ...p.log].slice(0, 30) }));
+    } else {
+      setG((p) => {
+        const s = advance(p, 45);
+        s.cash = Math.max(0, s.cash - 3000);
+        s.log = ["The argument failed. 45 minutes and ₦3,000 later, you are free.", ...s.log].slice(0, 30);
+        return s;
+      });
+    }
+    setPending(null);
+  };
+
+  /* ───────────── render ───────────── */
+  if (phase === "boot")
+    return (
+      <div className="ll"><style>{CSS}</style><div className="wrap"><p>Loading Lagos…</p></div></div>
+    );
+  if (phase === "auth")
+    return (
+      <div className="ll"><style>{CSS}</style><Auth onSignup={signup} onLogin={login} onSolo={solo} /></div>
+    );
+
+  const L = LOCS[g.loc];
+  const h = hourOf(g.t);
+  const open = isOpen(g.loc, h);
+  const here = people.filter((p) => p.u !== user && p.loc === g.loc && isOnline(p));
+  const actions = [...(ACTIONS[g.loc] || [])];
+  if (here.length)
+    actions.push({
+      id: "hang",
+      label: `Hang out with ${here.slice(0, 2).map((p) => p.name).join(" and ")}${here.length > 2 ? " and others" : ""}`,
+      mins: 60,
+      fx: { social: 25, mood: 10 },
+    });
+  const light = powerOn(g);
+  const byCash = [...people].sort((a, b) => b.cash - a.cash).slice(0, 5);
+  const profMap = Object.fromEntries(people.map((p) => [p.u, p]));
+
+  return (
+    <div className="ll">
+      <style>{CSS}</style>
+      {toast && <div className="toast" role="status">{toast}</div>}
+      <div className="wrap">
+        <div className="topbar">
+          <span className="pill">Day {dayOf(g.t)}, {fmtClock(g.t)}</span>
+          <span className={`pill ${light ? "" : "warn"}`}>{light ? "Light on" : "NEPA took light"}</span>
+          <span className="pill">{naira(g.cash)}</span>
+        </div>
+
+        {tab === "life" && (
+          <>
+            <div className="bus">
+              <div className="row between">
+                <h2 className="paint">{L.name}</h2>
+                <span style={{ fontSize: 34 }} aria-hidden="true">{L.icon}</span>
+              </div>
+              <div style={{ color: "#4A3A00", fontWeight: 600, fontSize: 14, marginTop: 4 }}>
+                {L.area}. {open ? "Open now" : `Opens ${hr(L.hours[0])}`}
+              </div>
+              <div className="band paint">{L.slogan}</div>
+            </div>
+
+            <div className="panel">
+              <div className="needs">
+                {NEEDS.map(([id, label, color]) => (
+                  <Bar key={id} id={id} label={label} color={color} value={g[id]} />
+                ))}
+              </div>
+            </div>
+
+            <div className="panel">
+              <h3>What do you do here?</h3>
+              {actions.map((a) => {
+                const why = blockReason(a, g);
+                return (
+                  <button key={a.id} className="act" disabled={!!why} onClick={() => run(a)}>
+                    <b>{a.label}</b>
+                    <span>{fmtDur(a.mins)}. {fxText(a)}</span>
+                    {why && <span className="why">{why}</span>}
+                  </button>
+                );
+              })}
+              {actions.length === 0 && <p className="hint">Nothing to do here. Try another place from the Map tab.</p>}
+            </div>
+
+            <div className="panel">
+              <h3>Recent</h3>
+              <ul className="log">
+                {g.log.slice(0, 5).map((l, i) => (
+                  <li key={i}>{l}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="row between" style={{ marginTop: 14 }}>
+              <span className="hint" style={{ margin: 0 }}>{g.avatar} {g.name}{net ? "" : " (solo)"}</span>
+              <button className="btn alt sm" onClick={logout}>Log out</button>
+            </div>
+          </>
+        )}
+
+        {tab === "map" && (
+          <div>
+            <h2 className="paint" style={{ margin: "4px 0 0", fontSize: 28 }}>Where to?</h2>
+            {Object.entries(LOCS).map(([id, l]) => {
+              const count = people.filter((p) => p.u !== user && p.loc === id && isOnline(p)).length;
+              return (
+                <button key={id} className="loc" aria-current={g.loc === id} disabled={g.loc === id} onClick={() => setDest(id)}>
+                  <span className="ic" style={{ background: l.bg }} aria-hidden="true">{l.icon}</span>
+                  <span style={{ flex: 1 }}>
+                    <b>{l.name}</b>
+                    <small>
+                      {l.area}. {isOpen(id, h) ? "Open" : `Opens ${hr(l.hours[0])}`}
+                      {count ? `. ${count} player${count > 1 ? "s" : ""} here` : ""}
+                    </small>
+                  </span>
+                  {g.loc === id && <small>You're here</small>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {tab === "people" && (
+          <div>
+            {!net && <div className="panel"><p className="hint" style={{ margin: 0 }}>Log in with an account to meet other players.</p></div>}
+            {net && (
+              <>
+                <div className="panel" style={{ marginTop: 0 }}>
+                  <h3>Here at {L.name}</h3>
+                  {here.length === 0 && <p className="hint" style={{ margin: 0 }}>Nobody else is here right now. Try the Map tab to find a busy spot.</p>}
+                  {here.map((p) => (
+                    <div className="person" key={p.u}>
+                      <span style={{ fontSize: 26 }}>{p.avatar}</span>
+                      <span className="nm"><b>{p.name}</b><small>Day {p.day}</small></span>
+                      {!fr.friends.includes(p.u) && (
+                        <button className="btn sm" disabled={sent.includes(p.u)} onClick={() => requestFriend(p.u)}>{sent.includes(p.u) ? "Requested" : "Add friend"}</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {fr.incoming.length > 0 && (
+                  <div className="panel">
+                    <h3>Friend requests</h3>
+                    {fr.incoming.map((u) => (
+                      <div className="person" key={u}>
+                        <span className="nm"><b>{u}</b></span>
+                        <button className="btn sm" onClick={() => acceptFriend(u)}>Accept</button>
+                        <button className="btn alt sm" onClick={() => declineFriend(u)}>Decline</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="panel">
+                  <h3>Friends</h3>
+                  {fr.friends.length === 0 && <p className="hint" style={{ margin: 0 }}>No friends yet. Add someone by username below.</p>}
+                  {fr.friends.map((u) => {
+                    const p = profMap[u];
+                    return (
+                      <div className="person" key={u}>
+                        <span style={{ fontSize: 26 }}>{p ? p.avatar : "🧑🏾"}</span>
+                        <span className="nm">
+                          <b>{p ? p.name : u}</b>
+                          <small><span className={`dot ${p && isOnline(p) ? "on" : ""}`} />{p ? (isOnline(p) ? `At ${LOCS[p.loc].name}` : "Offline") : "Offline"}</small>
+                        </span>
+                        <button className="btn alt sm" onClick={() => sendGift(u)}>Send ₦1,000</button>
+                      </div>
+                    );
+                  })}
+                  <label className="lbl" htmlFor="af">Add a friend</label>
+                  <div className="row">
+                    <input id="af" className="in" placeholder="Username" value={addName} autoCapitalize="none" onChange={(e) => setAddName(e.target.value)} />
+                    <button className="btn" onClick={() => requestFriend(addName)}>Send</button>
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <h3>Richest hustlers</h3>
+                  {byCash.map((p, i) => (
+                    <div className="person" key={p.u}>
+                      <span style={{ width: 18, fontWeight: 700 }}>{i + 1}</span>
+                      <span style={{ fontSize: 22 }}>{p.avatar}</span>
+                      <span className="nm"><b>{p.name}</b><small>Day {p.day}</small></span>
+                      <b>{naira(p.cash)}</b>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {tab === "chat" && (
+          <div className="panel" style={{ marginTop: 0 }}>
+            <h3>Chat at {L.name}</h3>
+            {!net ? (
+              <p className="hint" style={{ margin: 0 }}>Log in with an account to chat.</p>
+            ) : (
+              <>
+                <div className="chat">
+                  {chat.length === 0 && <p className="hint" style={{ margin: 0 }}>Quiet in here. Say something.</p>}
+                  {chat.map((m, i) => (
+                    <div key={i} className={`msg ${m.u === user ? "me" : ""}`}>
+                      <small>{m.avatar} {m.name}</small>
+                      {m.text}
+                    </div>
+                  ))}
+                  <div ref={chatEnd} />
+                </div>
+                <div className="row" style={{ marginTop: 10 }}>
+                  <input className="in" placeholder="Type a message" value={draft} maxLength={140} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => e.key === "Enter" && sendChat()} />
+                  <button className="btn" onClick={sendChat}>Send</button>
+                </div>
+                <p className="hint">Messages are public to everyone who visits this place.</p>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {dest && (
+        <div className="sheet-bg" onClick={() => setDest(null)}>
+          <div className="sheet" role="dialog" aria-label="Choose how to travel" onClick={(e) => e.stopPropagation()}>
+            <h2 className="paint" style={{ margin: "0 0 4px", fontSize: 26 }}>To {LOCS[dest].name}</h2>
+            {Object.entries(MODES).map(([id, m]) => {
+              const cost = travelCost(g.loc, dest, id);
+              return (
+                <button key={id} className="act" disabled={cost > g.cash} onClick={() => goTo(id)}>
+                  <b>{m.label}: {naira(cost)}, about {travelMins(g.loc, dest, id)} min</b>
+                  <span>{cost > g.cash ? "Not enough cash" : m.note}</span>
+                </button>
+              );
+            })}
+            <button className="btn alt" style={{ width: "100%", marginTop: 12 }} onClick={() => setDest(null)}>Stay here</button>
+          </div>
+        </div>
+      )}
+
+      {pending === "checkpoint" && (
+        <div className="sheet-bg">
+          <div className="sheet" role="dialog" aria-label="Police checkpoint">
+            <h2 className="paint" style={{ margin: "0 0 6px", fontSize: 26 }}>Checkpoint ahead</h2>
+            <p style={{ margin: "0 0 10px" }}>An officer flags you down: “Oga, what do you have for the boys?”</p>
+            <button className="act" onClick={payOfficer}><b>Settle him with ₦1,000</b><span>Quick and quiet</span></button>
+            <button className="act" onClick={argueOfficer}><b>Argue your case</b><span>Might be free, might cost ₦3,000 and 45 minutes</span></button>
+          </div>
+        </div>
+      )}
+
+      <nav className="nav" aria-label="Main">
+        <div>
+          {[["life", "Life"], ["map", "Map"], ["people", "People"], ["chat", "Chat"]].map(([id, label]) => (
+            <button key={id} aria-current={tab === id} onClick={() => setTab(id)}>
+              {label}
+              {id === "people" && fr.incoming.length > 0 && <span className="badge">{fr.incoming.length}</span>}
+            </button>
+          ))}
+        </div>
+      </nav>
+    </div>
+  );
+}
